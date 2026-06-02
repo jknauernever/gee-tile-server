@@ -8,9 +8,13 @@ import ee from '@google/earthengine';
 // numbers (within EE's bestEffort pixel scaling).
 //
 // Pools & sources:
-//   • Above- & below-ground biomass carbon — NASA/ORNL Global Aboveground and
-//     Belowground Biomass Carbon Density (Spawn et al. 2020), bands agb / bgb
-//     in Mg C/ha @ 300 m, 2010, with agb_uncertainty / bgb_uncertainty.
+//   • Above-ground biomass — GEDI L4A footprints (NASA spaceborne lidar, 25 m
+//     AGBD, Mg/ha) sampled inside the parcel when enough quality footprints
+//     fall within it; otherwise ESA CCI Above-Ground Biomass v6.0 (100 m,
+//     2022). Both are dry biomass → carbon via the IPCC 0.47 fraction. The
+//     response reports which source was used and the GEDI footprint count.
+//   • Below-ground biomass carbon — modeled from above-ground via an IPCC
+//     root-to-shoot ratio (no fine global measured BGB product exists).
 //   • Soil organic carbon — OpenLandMap SOC *content* (g/kg) × OpenLandMap
 //     bulk density (kg/m³), trapezoid-integrated over 0–30 cm → t C/ha stock.
 //   • Land cover make-up — ESA WorldCover v200 (10 m) class histogram.
@@ -26,7 +30,10 @@ try {
   console.error('Error parsing GEE_SERVICE_ACCOUNT:', e.message);
 }
 
-const C_TO_CO2E = 44 / 12; // molecular-weight ratio: 1 t C ⇄ 3.667 t CO₂e
+const C_TO_CO2E = 44 / 12;        // molecular-weight ratio: 1 t C ⇄ 3.667 t CO₂e
+const CARBON_FRACTION = 0.47;     // IPCC default: t carbon per t above-ground dry biomass
+const ROOT_SHOOT_RATIO = 0.24;    // IPCC-range default: below-ground ÷ above-ground biomass
+const MIN_GEDI_FOOTPRINTS = 5;    // need ≥ this many quality GEDI footprints in the parcel to prefer GEDI over ESA CCI
 
 // ESA WorldCover class codes → human labels (v100/v200 share this scheme).
 const WORLDCOVER_CLASSES = {
@@ -99,8 +106,23 @@ export default async (req, res) => {
 
     const geom = ee.Geometry.Polygon(geometry.coordinates);
 
-    // ── Biomass carbon density (Mg C/ha) ──────────────────────────────────
-    const biomass = ee.ImageCollection('NASA/ORNL/biomass_carbon_density/v1').mosaic();
+    // ── Above-ground biomass, fallback layer — ESA CCI v6.0 (Mg/ha) ───────
+    // 100 m, latest epoch (2022). `agb` is oven-dry woody biomass; `agb_sd` is
+    // the product's per-pixel uncertainty (1σ). Used when GEDI is too sparse.
+    const agbImg = ee.Image('ESA/CCI/Above_Ground_Biomass/V6_0/2022').select(['agb', 'agb_sd']);
+
+    // ── Above-ground biomass, preferred layer — GEDI L4A footprints ───────
+    // NASA spaceborne lidar, 25 m footprint AGBD (Mg/ha). Keep only quality
+    // footprints (l4_quality_flag==1, degrade_flag==0). Sparse and limited to
+    // ±51.6° latitude, so we measure how many land in the parcel and fall back
+    // to ESA CCI below MIN_GEDI_FOOTPRINTS.
+    const gediMasked = ee.ImageCollection('LARSE/GEDI/GEDI04_A_002_MONTHLY')
+      .filterBounds(geom)
+      .map((img) => {
+        const ok = img.select('l4_quality_flag').eq(1).and(img.select('degrade_flag').eq(0));
+        return img.select('agbd').updateMask(ok);
+      })
+      .mosaic();
 
     // ── Soil: OC content (g/kg, scale ×5) and bulk density (kg/m³, scale ×10)
     // at the 0/10/30 cm standard depths, renamed so we can read them in JS.
@@ -118,9 +140,7 @@ export default async (req, res) => {
 
     // One reduceRegion for every continuous band (mean), bestEffort so big
     // polygons coarsen the scale instead of failing on maxPixels.
-    const meanImage = biomass
-      .select(['agb', 'bgb', 'agb_uncertainty', 'bgb_uncertainty'])
-      .addBands(soc).addBands(bd).addBands(ndvi);
+    const meanImage = agbImg.addBands(soc).addBands(bd).addBands(ndvi);
 
     const meansP = evaluate(meanImage.reduceRegion({
       reducer: ee.Reducer.mean(),
@@ -141,19 +161,43 @@ export default async (req, res) => {
       reducer: ee.Reducer.frequencyHistogram(), geometry: geom, scale: 10, bestEffort: true, maxPixels: 1e9,
     }));
 
+    // GEDI footprint stats inside the parcel: mean/stdDev AGBD + valid count.
+    const gediStatsP = evaluate(gediMasked.reduceRegion({
+      reducer: ee.Reducer.mean().combine(ee.Reducer.stdDev(), '', true).combine(ee.Reducer.count(), '', true),
+      geometry: geom, scale: 25, bestEffort: true, maxPixels: 1e9,
+    }));
+
     // True geodesic area (m² → ha). 1 m tolerance.
     const areaP = evaluate(geom.area(1));
     const s2CountP = evaluate(s2.size());
 
-    const [means, ndviStd, hist, areaM2, s2Count] = await Promise.all([meansP, ndviStdP, histP, areaP, s2CountP]);
+    const [means, ndviStd, hist, areaM2, s2Count, gediStats] = await Promise.all([meansP, ndviStdP, histP, areaP, s2CountP, gediStatsP]);
 
     const areaHectares = areaM2 / 10000;
 
-    // ── Biomass carbon (already a carbon density, Mg C/ha == t C/ha) ───────
-    const agbDensity = means.agb ?? 0;            // t C/ha
-    const bgbDensity = means.bgb ?? 0;            // t C/ha
-    const agbUncDensity = means.agb_uncertainty ?? 0;
-    const bgbUncDensity = means.bgb_uncertainty ?? 0;
+    // ── Biomass carbon ────────────────────────────────────────────────────
+    // Prefer GEDI L4A footprints when enough quality footprints fell inside the
+    // parcel; otherwise use the ESA CCI wall-to-wall product. Both give
+    // above-ground *biomass* (dry matter, Mg/ha) → carbon via the IPCC carbon
+    // fraction. Below-ground carbon is modeled via an IPCC root-to-shoot ratio.
+    // All densities in t C/ha.
+    const gediCount = gediStats.agbd_count ?? 0;
+    const gediMean = gediStats.agbd_mean;
+    const useGedi = gediCount >= MIN_GEDI_FOOTPRINTS && gediMean != null;
+
+    const cciBiomass = means.agb ?? 0;                      // Mg/ha
+    const cciBiomassSd = means.agb_sd ?? 0;                 // Mg/ha (1σ)
+
+    const agbBiomass = useGedi ? gediMean : cciBiomass;     // Mg dry biomass/ha
+    // 1σ density (Mg/ha): GEDI → spatial stdDev across footprints; ESA CCI →
+    // the product's own per-pixel SD.
+    const agbBiomassSd = useGedi ? (gediStats.agbd_stdDev ?? 0) : cciBiomassSd;
+    const agbSource = useGedi ? 'GEDI L4A (lidar footprints)' : 'ESA CCI Biomass v6.0';
+
+    const agbDensity = agbBiomass * CARBON_FRACTION;        // t C/ha
+    const bgbDensity = agbDensity * ROOT_SHOOT_RATIO;       // t C/ha (modeled)
+    const agbUncDensity = agbBiomassSd * CARBON_FRACTION;   // t C/ha (1σ)
+    const bgbUncDensity = agbUncDensity * ROOT_SHOOT_RATIO;
 
     // ── Soil organic carbon stock, 0–30 cm (t C/ha) ───────────────────────
     // content[g C/kg] × bulkDensity[kg/m³] = g C/m³; integrate over depth (m)
@@ -219,6 +263,11 @@ export default async (req, res) => {
       uncertainty_co2e: {
         biomass_plus_minus: round(biomassUncC * C_TO_CO2E),
       },
+      biomass_source: {
+        above_ground: agbSource,
+        used_gedi: useGedi,
+        gedi_footprints: gediCount,
+      },
       vegetation: {
         ndvi_mean: means.ndvi != null ? round(means.ndvi, 3) : null,
         ndvi_std: ndviStd.ndvi != null ? round(ndviStd.ndvi, 3) : null,
@@ -226,7 +275,7 @@ export default async (req, res) => {
       },
       land_cover: landCover,
       sources: {
-        biomass: 'NASA/ORNL Global Aboveground & Belowground Biomass Carbon Density (Spawn et al. 2020), 300 m, 2010',
+        biomass: 'Above-ground from GEDI L4A lidar footprints (25 m AGBD) when ≥5 land in the parcel, else ESA CCI Biomass v6.0 (100 m, 2022); dry biomass → carbon ×0.47 IPCC; below-ground modeled ×0.24 root-to-shoot',
         soil: 'OpenLandMap Soil Organic Carbon Content × Bulk Density (USDA), 250 m, integrated 0–30 cm',
         land_cover: 'ESA WorldCover v200, 10 m',
         vegetation: 'Copernicus Sentinel-2 SR (median NDVI, last 12 months, <40% cloud)',
