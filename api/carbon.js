@@ -8,9 +8,11 @@ import ee from '@google/earthengine';
 // numbers (within EE's bestEffort pixel scaling).
 //
 // Pools & sources:
-//   • Above- & below-ground biomass carbon — NASA/ORNL Global Aboveground and
-//     Belowground Biomass Carbon Density (Spawn et al. 2020), bands agb / bgb
-//     in Mg C/ha @ 300 m, 2010, with agb_uncertainty / bgb_uncertainty.
+//   • Above-ground biomass — ESA CCI Above-Ground Biomass v6.0, band `agb`
+//     (Mg/ha dry woody biomass) @ 100 m, 2022, with `agb_sd` uncertainty.
+//     Converted to carbon with the IPCC 0.47 carbon fraction.
+//   • Below-ground biomass carbon — modeled from above-ground via an IPCC
+//     root-to-shoot ratio (no fine global measured BGB product exists).
 //   • Soil organic carbon — OpenLandMap SOC *content* (g/kg) × OpenLandMap
 //     bulk density (kg/m³), trapezoid-integrated over 0–30 cm → t C/ha stock.
 //   • Land cover make-up — ESA WorldCover v200 (10 m) class histogram.
@@ -26,7 +28,9 @@ try {
   console.error('Error parsing GEE_SERVICE_ACCOUNT:', e.message);
 }
 
-const C_TO_CO2E = 44 / 12; // molecular-weight ratio: 1 t C ⇄ 3.667 t CO₂e
+const C_TO_CO2E = 44 / 12;        // molecular-weight ratio: 1 t C ⇄ 3.667 t CO₂e
+const CARBON_FRACTION = 0.47;     // IPCC default: t carbon per t above-ground dry biomass
+const ROOT_SHOOT_RATIO = 0.24;    // IPCC-range default: below-ground ÷ above-ground biomass
 
 // ESA WorldCover class codes → human labels (v100/v200 share this scheme).
 const WORLDCOVER_CLASSES = {
@@ -99,8 +103,10 @@ export default async (req, res) => {
 
     const geom = ee.Geometry.Polygon(geometry.coordinates);
 
-    // ── Biomass carbon density (Mg C/ha) ──────────────────────────────────
-    const biomass = ee.ImageCollection('NASA/ORNL/biomass_carbon_density/v1').mosaic();
+    // ── Above-ground biomass — ESA CCI Biomass v6.0 (Mg/ha dry matter) ────
+    // 100 m, latest epoch (2022). `agb` is oven-dry woody biomass; `agb_sd` is
+    // the product's per-pixel uncertainty (1σ). Converted to carbon below.
+    const agbImg = ee.Image('ESA/CCI/Above_Ground_Biomass/V6_0/2022').select(['agb', 'agb_sd']);
 
     // ── Soil: OC content (g/kg, scale ×5) and bulk density (kg/m³, scale ×10)
     // at the 0/10/30 cm standard depths, renamed so we can read them in JS.
@@ -118,9 +124,7 @@ export default async (req, res) => {
 
     // One reduceRegion for every continuous band (mean), bestEffort so big
     // polygons coarsen the scale instead of failing on maxPixels.
-    const meanImage = biomass
-      .select(['agb', 'bgb', 'agb_uncertainty', 'bgb_uncertainty'])
-      .addBands(soc).addBands(bd).addBands(ndvi);
+    const meanImage = agbImg.addBands(soc).addBands(bd).addBands(ndvi);
 
     const meansP = evaluate(meanImage.reduceRegion({
       reducer: ee.Reducer.mean(),
@@ -149,11 +153,16 @@ export default async (req, res) => {
 
     const areaHectares = areaM2 / 10000;
 
-    // ── Biomass carbon (already a carbon density, Mg C/ha == t C/ha) ───────
-    const agbDensity = means.agb ?? 0;            // t C/ha
-    const bgbDensity = means.bgb ?? 0;            // t C/ha
-    const agbUncDensity = means.agb_uncertainty ?? 0;
-    const bgbUncDensity = means.bgb_uncertainty ?? 0;
+    // ── Biomass carbon ────────────────────────────────────────────────────
+    // ESA CCI gives above-ground *biomass* (dry matter); convert to carbon with
+    // the IPCC carbon fraction. Below-ground carbon is modeled from above-ground
+    // via an IPCC root-to-shoot ratio. All densities in t C/ha.
+    const agbBiomass = means.agb ?? 0;                      // Mg dry biomass/ha
+    const agbBiomassSd = means.agb_sd ?? 0;                 // Mg/ha (1σ)
+    const agbDensity = agbBiomass * CARBON_FRACTION;        // t C/ha
+    const bgbDensity = agbDensity * ROOT_SHOOT_RATIO;       // t C/ha (modeled)
+    const agbUncDensity = agbBiomassSd * CARBON_FRACTION;   // t C/ha (1σ)
+    const bgbUncDensity = agbUncDensity * ROOT_SHOOT_RATIO;
 
     // ── Soil organic carbon stock, 0–30 cm (t C/ha) ───────────────────────
     // content[g C/kg] × bulkDensity[kg/m³] = g C/m³; integrate over depth (m)
@@ -226,7 +235,7 @@ export default async (req, res) => {
       },
       land_cover: landCover,
       sources: {
-        biomass: 'NASA/ORNL Global Aboveground & Belowground Biomass Carbon Density (Spawn et al. 2020), 300 m, 2010',
+        biomass: 'ESA CCI Above-Ground Biomass v6.0, 100 m, 2022 (oven-dry woody biomass → carbon ×0.47 IPCC fraction; below-ground modeled ×0.24 root-to-shoot)',
         soil: 'OpenLandMap Soil Organic Carbon Content × Bulk Density (USDA), 250 m, integrated 0–30 cm',
         land_cover: 'ESA WorldCover v200, 10 m',
         vegetation: 'Copernicus Sentinel-2 SR (median NDVI, last 12 months, <40% cloud)',
